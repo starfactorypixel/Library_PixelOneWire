@@ -1,10 +1,14 @@
 {
-	"name": "PixelOneWire",
-	"description": "The OneWire library for STM32 part of Pixel project",
-	"version": "0.0.1",
-	"repository": {
-	  "type": "git",
-	  "url": "https://github.com/starfactorypixel/Library_PixelOneWire.git"
-	},
-	"headers": ["OneWireDriver.h", "OneWireTSens.h", "OneWireTSensEx.h"]
+  "name": "PixelOneWire",
+  "description": "The OneWire library for STM32 part of Pixel project",
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/starfactorypixel/Library_PixelOneWire.git"
+  },
+  "headers": [
+    "OneWireDriver.h",
+    "OneWireTSens.h",
+    "OneWireTSensEx.h"
+  ]
 }
