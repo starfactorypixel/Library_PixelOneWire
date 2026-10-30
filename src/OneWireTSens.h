@@ -1,207 +1,310 @@
 #pragma once
-#include <inttypes.h>
+#include <stdint.h>
 #include "OneWireDriver.h"
+#include "OneWireTSensor.h"
 
-// https://cdn-shop.adafruit.com/datasheets/DS18B20.pdf
-// https://www.analog.com/media/en/technical-documentation/data-sheets/DS18S20.pdf
+/*
+ *	Датчики температуры DS18x20 на одной шине 1-Wire: таблица датчиков, поиск, опрос.
+ *
+ *	Неблокирующий режим (вызывать в главном цикле):
+ *
+ *		OneWireDriver bus(GPIOB, GPIO_PIN_9, &htim1);
+ *		OneWireTSens<16> sensors(bus);
+ *
+ *		if(sensors.Processing(HAL_GetTick()))
+ *		{
+ *			for(uint8_t i = 0; i < sensors.Count(); ++i)
+ *			{
+ *				if(sensors[i].IsValid() == false) continue;
+ *				temp[i] = sensors[i].GetTemp() / 100;
+ *			}
+ *		}
+ *
+ *	Блокирующий режим:
+ *
+ *		sensors.Search();
+ *		sensors.Convert();
+ *		HAL_Delay(800);
+ *		sensors.ReadAll();
+ *
+ *	Необязательный колбэк вызывается каждый раз, когда прочитаны все датчики
+ *	(в Processing() и в ReadAll()). Лямбда без захвата подходит:
+ *
+ *		sensors.RegReadyCallback([](const OneWireTSensor *sensor, uint8_t count)
+ *		{
+ *			for(uint8_t i = 0; i < count; ++i)
+ *			{
+ *				if(sensor[i].IsValid() == false) continue;
+ *				temp[i] = sensor[i].GetTemp() / 100;
+ *			}
+ *		});
+ *
+ *	Неиспользуемый режим в прошивку не попадает (методы шаблона компилируются только при вызове).
+ */
 
-template <uint8_t _max_sensor> 
+template <uint8_t _max_sensor>
 class OneWireTSens
 {
 	public:
-		
-		static constexpr uint8_t CMD_CONVERT_T = 0x44;
-		static constexpr uint8_t CMD_WRITE_SCRATCHPAD = 0x4E;
-		static constexpr uint8_t CMD_READ_SCRATCHPAD = 0xBE;
-		static constexpr uint8_t CMD_COPY_SCRATCHPAD = 0x48;
-		static constexpr uint8_t CMD_RECALL_E2 = 0xB8;
-		static constexpr uint8_t CMD_READ_POWER_SUPPLY = 0xB4;
-		
-		static constexpr int16_t NO_VALID_TEMP = INT16_MAX;
-		
-		struct __attribute__((packed)) scratchpad_t
-		{
-			union
-			{
-				uint8_t raw[9];
-				struct __attribute__((packed))
-				{
-					int16_t temp;
-					uint8_t temp_h;
-					uint8_t temp_l;
-					uint8_t cfg;
-					uint8_t _reserved[3];
-					uint8_t crc;
-				};
-			};
-		};
-		
-		
-		OneWireTSens(OneWireDriver &driver) : _driver(driver), _roms_count(0)
+
+		static constexpr int16_t NO_VALID_TEMP = OneWireTSensor::NO_VALID_TEMP;
+		static constexpr uint16_t RETRY_TIME = 5000;		// мс, повтор поиска, если датчики не найдены
+
+
+		using callback_ready_t = void (*)(const OneWireTSensor *sensor, uint8_t count);
+
+
+		// period — период опроса в неблокирующем режиме, мс
+		OneWireTSens(OneWireDriver &driver, uint16_t period = 2000) :
+			_driver(driver), _count(0), _callback_ready(nullptr),
+			_period(period), _state(STATE_SEARCH_BEGIN), _idx(0), _timer(0)
 		{}
-		
-		uint8_t SearchFiltered()
+
+		// Необязательный колбэк «прочитаны все датчики». nullptr — отключить.
+		void RegReadyCallback(callback_ready_t callback)
 		{
-			memset(_roms, 0x00, sizeof(_roms));
-			_roms_count = 0;
-			
-			OneWireDriver::rom_t tmp_roms[_max_sensor] = {};
-			uint8_t tmp_roms_count = _driver.SearchROM(tmp_roms);
-			for(uint8_t i = 0; i < tmp_roms_count; ++i)
-			{
-				if(tmp_roms[i].code != 0x10 && tmp_roms[i].code != 0x28) continue;
-				
-				_roms[_roms_count++] = tmp_roms[i];
-			}
-			
-			return _roms_count;
+			_callback_ready = callback;
+
+			return;
 		}
-		
+
+
+		uint8_t Count() const
+		{
+			return _count;
+		}
+
+		// Датчик по индексу, только чтение. При неверном индексе — пустой (всегда невалидный) датчик.
+		const OneWireTSensor &operator[](uint8_t idx) const
+		{
+			return (idx < _count) ? _sensors[idx] : OneWireTSensor::Empty();
+		}
+
+
+		// ---- Неблокирующий режим ----
+
+		// true — опрошены все датчики, свежие данные в таблице.
+		// За один вызов не больше одной операции на шине: поиск одного устройства (~15 мс),
+		// чтение одного датчика (~12 мс) или запуск конвертации (~2 мс).
+		bool Processing(uint32_t time)
+		{
+			switch(_state)
+			{
+				case STATE_SEARCH_BEGIN:
+				{
+					_SearchBegin();
+					_state = STATE_SEARCH;
+
+					break;
+				}
+
+				case STATE_SEARCH:
+				{
+					if(_SearchStep() == true)
+						break;		// Ищем по одному устройству за вызов
+
+					_timer = time;
+					_state = (_count > 0) ? STATE_CONVERT : STATE_NO_SENSOR;
+
+					break;
+				}
+
+				case STATE_NO_SENSOR:
+				{
+					if(time - _timer >= RETRY_TIME)
+						_state = STATE_SEARCH_BEGIN;
+
+					break;
+				}
+
+				case STATE_CONVERT:
+				{
+					// Если шина не ответила — не страшно: чтения не пройдут и сработает фильтр сбоев
+					Convert();
+					_state = STATE_CONVERT_WAIT;
+
+					break;
+				}
+
+				case STATE_CONVERT_WAIT:
+				{
+					if(time - _timer < OneWireTSensor::CONVERT_TIME)
+						break;
+
+					_idx = 0;
+					_state = STATE_READ;
+
+					break;
+				}
+
+				case STATE_READ:
+				{
+					_sensors[_idx].Read();
+					if(++_idx < _count)
+						break;		// Читаем по одному датчику за вызов
+
+					_ReadyNotify();
+					_state = STATE_PAUSE;
+
+					return true;
+				}
+
+				case STATE_PAUSE:
+				{
+					if(time - _timer < _period)
+						break;		// Период отсчитывается от прошлого запуска конвертации
+
+					_timer = time;
+					_state = STATE_CONVERT;
+
+					break;
+				}
+			}
+
+			return false;
+		}
+
+		// Перезапустить поиск датчиков (например, после замены датчика)
+		void Rescan()
+		{
+			_state = STATE_SEARCH_BEGIN;
+
+			return;
+		}
+
+
+		// ---- Блокирующий режим ----
+
+		// Найти все датчики. Остальные устройства на шине пропускаются.
 		uint8_t Search()
 		{
-			memset(_roms, 0x00, sizeof(_roms));
-			_roms_count = _driver.SearchROM(_roms);
-			
-			return _roms_count;
-		}
-		
-		
-		// Запустить конвертацию температуры по индексу датчика.
-		void Convert(uint8_t idx)
-		{
-			if(idx >= _roms_count)
-				return;					// Ошибка: индекс ненайденного датчика
-			
-			Convert(_roms[idx]);
-			
-			return;
-		}
-		
-		// Запустить конвертацию температуры по ROM
-		void Convert(const OneWireDriver::rom_t &rom)
-		{
-			if(_driver.Reset() == false)
-				return;					// Ошибка: устройство не отвечает
-			
-			_driver.CMD_MatchRom(rom);
-			_driver.WriteByte(CMD_CONVERT_T);
+			_SearchBegin();
+			while(_SearchStep() == true) {}
 
-			return;
+			return _count;
 		}
-		
-		// Запустить конвертацию температуры на всех датчиках
-		void Convert()
-		{
-			if(_driver.Reset() == false)
-				return;					// Ошибка: устройство не отвечает
-			
-			_driver.CMD_SkipRom();
-			_driver.WriteByte(CMD_CONVERT_T);
-			
-			return;
-		}
-		
-		
-		// Прочитать температуру с датчика по индексу
-		int16_t Read(uint8_t idx)
-		{
-			if(idx >= _roms_count)
-				return NO_VALID_TEMP;	// Ошибка: индекс ненайденного датчика
-			
-			return Read(_roms[idx]);
-		}
-		
-		// Прочитать температуру с датчика по ROM
-		int16_t Read(const OneWireDriver::rom_t &rom)
-		{
-			scratchpad_t scratchpad = {};
 
+		// Запустить конвертацию на всех датчиках сразу
+		bool Convert()
+		{
 			if(_driver.Reset() == false)
-				return NO_VALID_TEMP;	// Ошибка: устройство не отвечает
-			
-			_driver.CMD_MatchRom(rom);
-			_driver.WriteByte(CMD_READ_SCRATCHPAD);
-			_driver.ReadBytes(scratchpad.raw, sizeof(scratchpad.raw));
-			
-			if(_driver.crc8(scratchpad.raw, 8) != scratchpad.crc)
+				return false;
+
+			_driver.SkipRom();
+			_driver.WriteByte(OneWireTSensor::CMD_CONVERT_T);
+
+			return true;
+		}
+
+		// Прочитать все датчики. Возвращает количество удачных чтений.
+		uint8_t ReadAll()
+		{
+			uint8_t ok = 0;
+			for(uint8_t i = 0; i < _count; ++i)
 			{
-				DEBUG_LOG_ARRAY_HEX("ERR-CRC", scratchpad.raw, 9);
-				DEBUG_LOG_NEW_LINE();
-				return NO_VALID_TEMP;	// Ошибка: CRC не верное
+				if(_sensors[i].Read() == true)
+					ok++;
 			}
-			
-			return _ConvertTemp(rom, scratchpad);
+			_ReadyNotify();
+
+			return ok;
 		}
 
-		// Прочитать все датчики, найденные через `Search()`
-		uint8_t Read(int16_t *temp, uint8_t size)
+
+		// ---- Сводные значения по исправным датчикам (NO_VALID_TEMP, если исправных нет) ----
+
+		int16_t GetMinTemp() const
 		{
-			if(size < _roms_count)
-				return 0;
-			
-			uint8_t count = 0;
-			for(uint8_t i = 0; i < _roms_count; ++i)
+			int16_t result = NO_VALID_TEMP;
+			for(uint8_t i = 0; i < _count; ++i)
 			{
-				temp[i] = Read(_roms[i]);
-				count++;
+				if(_sensors[i].IsValid() == false) continue;
+				if(_sensors[i].GetTemp() < result) result = _sensors[i].GetTemp();
 			}
 
-			return count;
-		}
-		
-		
-		// Прочитать температуру с известным ROM в блокирующем режиме
-		int16_t ConvertAndRead(const OneWireDriver::rom_t &rom)
-		{
-			Convert(rom);
-			
-			HAL_Delay(750);
-			
-			return Read(rom);
+			return result;
 		}
 
-
-		// Получить список найденных ROM
-		uint8_t GetRomsPtr(OneWireDriver::rom_t *&roms, uint8_t &count)
+		int16_t GetAvgTemp() const
 		{
-			roms = _roms;
-			count = _roms_count;
-			
-			return _roms_count;
+			int32_t sum = 0;
+			uint8_t num = 0;
+			for(uint8_t i = 0; i < _count; ++i)
+			{
+				if(_sensors[i].IsValid() == false) continue;
+				sum += _sensors[i].GetTemp();
+				num++;
+			}
+
+			return (num > 0) ? (int16_t)(sum / num) : NO_VALID_TEMP;
 		}
-		
-		
-		const OneWireDriver::rom_t * const roms = _roms;
-		const uint8_t &roms_count = _roms_count;
-		
+
+		int16_t GetMaxTemp() const
+		{
+			int16_t result = NO_VALID_TEMP;
+			for(uint8_t i = 0; i < _count; ++i)
+			{
+				if(_sensors[i].IsValid() == false) continue;
+				if(result == NO_VALID_TEMP || _sensors[i].GetTemp() > result) result = _sensors[i].GetTemp();
+			}
+
+			return result;
+		}
+
 	private:
 
-		int16_t _ConvertTemp(const OneWireDriver::rom_t &rom, const scratchpad_t &scratchpad)
+		void _SearchBegin()
 		{
-			int16_t temp = NO_VALID_TEMP;
-			
-			switch(rom.code)
-			{
-				// DS1820, DS18S20
-				case 0x10:
-				{
-					temp = ((int32_t)scratchpad.temp * 100) / 2;
-					break;
-				}
+			_count = 0;
+			_driver.SearchBegin();
 
-				// DS18B20, DS1822
-				case 0x28:
-				{
-					temp = ((int32_t)scratchpad.temp * 100) / 16;
-					break;
-				}
-			}
-			
-			return temp;
+			return;
 		}
-		
-		
+
+		// Найти одно следующее устройство и добавить, если это датчик. false — поиск закончен.
+		bool _SearchStep()
+		{
+			if(_count >= _max_sensor)
+				return false;
+
+			OneWireDriver::rom_t rom;
+			if(_driver.SearchNext(rom) == false)
+				return false;
+
+			if(OneWireTSensor::IsSupported(rom) == true)
+				_sensors[_count++] = OneWireTSensor(_driver, rom);
+
+			return true;
+		}
+
+
+		void _ReadyNotify()
+		{
+			if(_callback_ready != nullptr)
+				_callback_ready(_sensors, _count);
+
+			return;
+		}
+
+
+		enum state_t : uint8_t
+		{
+			STATE_SEARCH_BEGIN,		// Начать поиск
+			STATE_SEARCH,			// Идёт поиск
+			STATE_NO_SENSOR,		// Датчики не найдены, ждём перед повтором
+			STATE_CONVERT,			// Запустить конвертацию
+			STATE_CONVERT_WAIT,		// Ждём окончания конвертации
+			STATE_READ,				// Читаем датчики по одному
+			STATE_PAUSE,			// Ждём следующего периода
+		};
+
 		OneWireDriver &_driver;
-		OneWireDriver::rom_t _roms[_max_sensor];
-		uint8_t _roms_count;
+		OneWireTSensor _sensors[_max_sensor];
+		uint8_t _count;
+		callback_ready_t _callback_ready;
+
+		uint16_t _period;
+		state_t _state;
+		uint8_t _idx;				// Индекс читаемого датчика, используется только в STATE_READ
+		uint32_t _timer;
 };

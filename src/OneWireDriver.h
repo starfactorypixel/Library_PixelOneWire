@@ -1,16 +1,29 @@
 #pragma once
-#include <inttypes.h>
+#include <stdint.h>
+#include <string.h>
+
+/*
+ *	Драйвер шины 1-Wire для STM32 HAL.
+ *
+ *	Требования:
+ *	 - таймер `htim` тактируется частотой 1 МГц (1 тик = 1 мкс), запущен (HAL_TIM_Base_Start)
+ *	   и больше никем не используется;
+ *	 - на линии внешний подтягивающий резистор (обычно 4.7 кОм).
+ *
+ *	Пин постоянно работает как выход с открытым стоком: запись 0 прижимает линию к земле,
+ *	запись 1 отпускает её. Читать линию можно в этом же режиме, переключать пин на вход не нужно.
+ */
 
 class OneWireDriver
 {
 	public:
-		
+
 		static constexpr uint8_t CMD_SEARCH_ROM = 0xF0;
 		static constexpr uint8_t CMD_READ_ROM = 0x33;
 		static constexpr uint8_t CMD_MATCH_ROM = 0x55;
 		static constexpr uint8_t CMD_SKIP_ROM = 0xCC;
 		static constexpr uint8_t CMD_ALARM_SEARCH = 0xEC;
-		
+
 		struct __attribute__((packed)) rom_t
 		{
 			union
@@ -18,138 +31,70 @@ class OneWireDriver
 				uint8_t raw[8];
 				struct __attribute__((packed))
 				{
-					uint8_t code;
+					uint8_t code;		// Family code
 					uint8_t sn[6];
 					uint8_t crc;
 				};
 			};
 		};
-		
-		enum error_t :int8_t
+
+
+		OneWireDriver(GPIO_TypeDef *port, uint16_t pin, TIM_HandleTypeDef *htim) :
+			_port(port), _pin(pin), _htim(htim)
+		{}
+
+
+		// Сброс шины. true — на шине есть хотя бы одно устройство.
+		bool Reset()
 		{
-			ERROR_NONE = 0,
-		};
-		
-		
-		OneWireDriver(GPIO_TypeDef *port, uint16_t pin, TIM_HandleTypeDef *htim) : 
-			_gpio_port(port), _gpio_pin(pin), _htim(htim),
-			_gpio_cfg{pin, GPIO_MODE_INPUT, GPIO_NOPULL, GPIO_SPEED_FREQ_HIGH}
-		{
-			// Инициализация пина как открытый сток
-			_SetPinAsOutput();
-			HAL_GPIO_WritePin(_gpio_port, _gpio_pin, GPIO_PIN_SET);
-			
-			return;
+			// Настраиваем пин при каждом сбросе: это дёшево и не зависит от того,
+			// был ли включён тактовый сигнал порта на момент вызова конструктора.
+			_PinInit();
+
+			if(_ReadPin() == 0)
+				return false;				// Линия прижата к земле: замыкание или нет подтяжки
+
+			_PinLow();
+			_DelayUs(480);
+
+			uint32_t irq = _IrqOff();
+			_PinHigh();
+			_DelayUs(70);
+			bool presence = (_ReadPin() == 0);
+			_IrqOn(irq);
+
+			_DelayUs(410);
+
+			return presence;
 		}
-		
-		template <uint8_t N> 
-		uint8_t SearchROM(rom_t (&roms)[N], bool alarm = false)
+
+		// Прочитать ROM единственного устройства на шине (если устройств несколько, CRC не сойдётся)
+		bool ReadRom(rom_t &rom)
 		{
-			uint8_t rom_idx = 0;
-			uint8_t lastDiscrepancy = 0;
-			uint8_t romByte[8];
-			
-			memset(romByte, 0x00, sizeof(romByte));
-			
-			bool searchComplete = false;
-			while(searchComplete == false && rom_idx < N)
-			{
-				if(Reset() == false)
-					break;
-				
-				WriteByte( (alarm ? CMD_ALARM_SEARCH : CMD_SEARCH_ROM) );
-				
-				uint8_t discrepancyMarker = 0;
-				
-				uint8_t bitIndex = 0;
-				while(bitIndex < 64)
-				{
-					uint8_t direction;
-					uint8_t bit = _ReadBit();
-					uint8_t complementBit = _ReadBit();
-					
-					if(bit && complementBit)
-					{
-						searchComplete = true;
-						
-						break;
-					}
-					
-					if(!bit && !complementBit)
-					{
-						if(bitIndex + 1 < lastDiscrepancy)
-						{
-							direction = (romByte[bitIndex / 8] >> (bitIndex % 8)) & 0x01;
-						}
-						else
-						{
-							direction = (bitIndex + 1 == lastDiscrepancy) ? 1 : 0;
-							discrepancyMarker = (direction == 0) ? bitIndex + 1 : discrepancyMarker;
-						}
-					}
-					else
-					{
-						direction = bit;
-					}
-					
-					if(direction)
-						romByte[bitIndex / 8] |= (1 << (bitIndex % 8));
-					else
-						romByte[bitIndex / 8] &= ~(1 << (bitIndex % 8));
-					
-					_WriteBit(direction);
-					
-					bitIndex++;
-				}
-				
-				lastDiscrepancy = discrepancyMarker;
-				if(lastDiscrepancy == 0)
-					searchComplete = true;
-				
-				if(crc8(romByte, sizeof(romByte)) != 0)
-					break;
-				
-				memcpy(&roms[rom_idx].raw, romByte, sizeof(romByte));
-				rom_idx++;
-			}
-			
-			return rom_idx;
+			if(Reset() == false)
+				return false;
+
+			WriteByte(CMD_READ_ROM);
+			ReadBytes(rom.raw, sizeof(rom.raw));
+
+			return (Crc8(rom.raw, sizeof(rom.raw)) == 0 && rom.code != 0x00);
 		}
-		
-		void CMD_MatchRom(const rom_t &romCode)
+
+		void MatchRom(const rom_t &rom)
 		{
 			WriteByte(CMD_MATCH_ROM);
-			WriteBytes(romCode.raw, sizeof(romCode.raw));
-			
+			WriteBytes(rom.raw, sizeof(rom.raw));
+
 			return;
 		}
-		
-		void CMD_SkipRom()
+
+		void SkipRom()
 		{
 			WriteByte(CMD_SKIP_ROM);
 
 			return;
 		}
-		
-		
-		// Сброс шины
-		bool Reset()
-		{
-			_SetPinAsOutput();
-			
-			HAL_GPIO_WritePin(_gpio_port, _gpio_pin, GPIO_PIN_RESET); // Сигнал RESET
-			_DelayUs(480);
-			
-			_SetPinAsInput();
-			_DelayUs(70);
-			
-			bool presence = (HAL_GPIO_ReadPin(_gpio_port, _gpio_pin) == GPIO_PIN_RESET);
-			_DelayUs(410);
-			
-			return presence;
-		}
-		
-		// Записать байт в шину
+
 		void WriteByte(uint8_t byte)
 		{
 			for(uint8_t i = 0; i < 8; ++i)
@@ -157,11 +102,10 @@ class OneWireDriver
 				_WriteBit(byte & 0x01);
 				byte >>= 1;
 			}
-			
+
 			return;
 		}
-		
-		// Прочитать байт из шины
+
 		uint8_t ReadByte()
 		{
 			uint8_t byte = 0x00;
@@ -169,37 +113,127 @@ class OneWireDriver
 			{
 				byte |= (_ReadBit() << i);
 			}
-			
+
 			return byte;
 		}
-		
-		// Записать `length` байт в шину из массива `data`
+
 		void WriteBytes(const uint8_t *data, uint8_t length)
 		{
 			for(uint8_t i = 0; i < length; ++i)
 			{
 				WriteByte(data[i]);
 			}
-			
+
 			return;
 		}
-		
-		// Прочитать `length` байт из шины в массив `data`
+
 		void ReadBytes(uint8_t *data, uint8_t length)
 		{
 			for(uint8_t i = 0; i < length; ++i)
 			{
 				data[i] = ReadByte();
 			}
-			
+
 			return;
 		}
-		
-		// Посчитать контрольную сумму для массива `data`
-		uint8_t crc8(const uint8_t *data, uint8_t length)
+
+
+		/*
+		 *	Поиск устройств (алгоритм Maxim AN187), по одному устройству за вызов:
+		 *
+		 *		OneWireDriver::rom_t rom;
+		 *		bus.SearchBegin();
+		 *		while(bus.SearchNext(rom)) { ... }
+		 *
+		 *	Порядок выдачи устройств всегда одинаковый (определяется их ROM).
+		 */
+		void SearchBegin(bool alarm_only = false)
+		{
+			memset(_search_rom.raw, 0x00, sizeof(_search_rom.raw));
+			_search_last = 0;
+			_search_done = false;
+			_search_cmd = alarm_only ? CMD_ALARM_SEARCH : CMD_SEARCH_ROM;
+
+			return;
+		}
+
+		// Найти следующее устройство. false — устройств больше нет или ошибка на шине.
+		bool SearchNext(rom_t &rom)
+		{
+			if(_search_done == true)
+				return false;
+
+			if(Reset() == false)
+				return _SearchStop();
+
+			WriteByte(_search_cmd);
+
+			uint8_t last_zero = 0;		// Номер бита последнего ветвления, где пошли по нулю
+			for(uint8_t bit = 1; bit <= 64; ++bit)
+			{
+				uint8_t &byte = _search_rom.raw[(bit - 1) / 8];
+				uint8_t mask = 1 << ((bit - 1) % 8);
+
+				uint8_t id = _ReadBit();		// Бит, который выдали устройства
+				uint8_t cmp = _ReadBit();		// Его инверсия
+				uint8_t dir;					// Куда идём
+
+				if(id == 1 && cmp == 1)
+					return _SearchStop();		// Никто не ответил
+
+				if(id != cmp)
+				{
+					dir = id;					// У всех оставшихся устройств этот бит одинаковый
+				}
+				else
+				{
+					// Ветвление: есть устройства и с 0, и с 1
+					if(bit < _search_last)
+						dir = (byte & mask) ? 1 : 0;		// До прошлой точки ветвления повторяем прежний путь
+					else
+						dir = (bit == _search_last) ? 1 : 0;	// В ней поворачиваем на 1, дальше всегда на 0
+
+					if(dir == 0)
+						last_zero = bit;				// Сюда вернёмся на следующем проходе
+				}
+
+				if(dir) byte |= mask;
+				else byte &= ~mask;
+
+				_WriteBit(dir);
+			}
+
+			// CRC от восьми нулей тоже равна 0, поэтому отдельно отсекаем пустой ROM
+			if(Crc8(_search_rom.raw, sizeof(_search_rom.raw)) != 0 || _search_rom.code == 0x00)
+				return _SearchStop();
+
+			_search_last = last_zero;
+			_search_done = (last_zero == 0);
+			rom = _search_rom;
+
+			return true;
+		}
+
+		// Найти все устройства сразу (блокирующе). Возвращает количество найденных.
+		template <uint8_t N>
+		uint8_t SearchAll(rom_t (&roms)[N], bool alarm_only = false)
+		{
+			uint8_t count = 0;
+
+			SearchBegin(alarm_only);
+			while(count < N && SearchNext(roms[count]))
+			{
+				count++;
+			}
+
+			return count;
+		}
+
+
+		static uint8_t Crc8(const uint8_t *data, uint8_t length)
 		{
 			uint8_t crc = 0x00;
-			
+
 			while(length--)
 			{
 				uint8_t inbyte = *data++;
@@ -211,12 +245,51 @@ class OneWireDriver
 					inbyte >>= 1;
 				}
 			}
-			
+
 			return crc;
 		}
-		
+
 	private:
-		
+
+		void _WriteBit(uint8_t bit)
+		{
+			// Длительность низкого уровня критична (особенно 6 мкс для «1»), поэтому без прерываний
+			uint32_t irq = _IrqOff();
+			_PinLow();
+			if(bit)
+			{
+				_DelayUs(6);
+				_PinHigh();
+				_IrqOn(irq);
+				_DelayUs(64);
+			}
+			else
+			{
+				_DelayUs(60);
+				_PinHigh();
+				_IrqOn(irq);
+				_DelayUs(10);
+			}
+
+			return;
+		}
+
+		uint8_t _ReadBit()
+		{
+			// Линию нужно прочитать не позже 15 мкс от начала слота, поэтому без прерываний
+			uint32_t irq = _IrqOff();
+			_PinLow();
+			_DelayUs(6);
+			_PinHigh();
+			_DelayUs(9);
+			uint8_t bit = _ReadPin();
+			_IrqOn(irq);
+
+			_DelayUs(55);
+
+			return bit;
+		}
+
 		void _DelayUs(uint16_t us)
 		{
 			__HAL_TIM_SET_COUNTER(_htim, 0);
@@ -224,67 +297,71 @@ class OneWireDriver
 			{
 				__NOP();
 			}
-			
-			return;
-		}
-		
-		void _SetPinAsOutput()
-		{
-			_gpio_cfg.Mode = GPIO_MODE_OUTPUT_OD;
-			HAL_GPIO_Init(_gpio_port, &_gpio_cfg);
-			
-			return;
-		}
-		
-		void _SetPinAsInput()
-		{
-			_gpio_cfg.Mode = GPIO_MODE_INPUT;
-			HAL_GPIO_Init(_gpio_port, &_gpio_cfg);
-			
-			return;
-		}
-		
-		void _WriteBit(uint8_t bit)
-		{
-			const uint16_t delay_low[2] = {60, 6};
-			const uint16_t delay_high[2] = {10, 64};
-			
-			_SetPinAsOutput();
 
-			HAL_GPIO_WritePin(_gpio_port, _gpio_pin, GPIO_PIN_RESET);
-			_DelayUs( delay_low[bit] );
-			
-			HAL_GPIO_WritePin(_gpio_port, _gpio_pin, GPIO_PIN_SET);
-			_DelayUs( delay_high[bit] );
-			
 			return;
 		}
-		
-		uint8_t _ReadBit()
+
+		void _PinInit()
 		{
-			uint8_t bit;
-			
-			__disable_irq();
-			
-			_SetPinAsOutput();
-			HAL_GPIO_WritePin(_gpio_port, _gpio_pin, GPIO_PIN_RESET);
-			_DelayUs(6);
-			
-			_SetPinAsInput();
-			_DelayUs(9);
-			
-			bit = HAL_GPIO_ReadPin(_gpio_port, _gpio_pin);
-			
-			__enable_irq();
-			
-			_DelayUs(55);
-			
-			return bit;
+			// Сначала 1 в выходной регистр, чтобы при переключении режима не было импульса на линии
+			_PinHigh();
+
+			GPIO_InitTypeDef cfg = {};
+			cfg.Pin = _pin;
+			cfg.Mode = GPIO_MODE_OUTPUT_OD;
+			cfg.Pull = GPIO_NOPULL;
+			cfg.Speed = GPIO_SPEED_FREQ_HIGH;
+			HAL_GPIO_Init(_port, &cfg);
+
+			return;
 		}
-		
-		
-		GPIO_TypeDef *_gpio_port;
-		uint16_t _gpio_pin;
+
+		void _PinLow()
+		{
+			HAL_GPIO_WritePin(_port, _pin, GPIO_PIN_RESET);
+		}
+
+		// Открытый сток: 1 в выходной регистр отпускает линию, высокий уровень даёт внешняя подтяжка
+		void _PinHigh()
+		{
+			HAL_GPIO_WritePin(_port, _pin, GPIO_PIN_SET);
+		}
+
+		uint8_t _ReadPin()
+		{
+			return (HAL_GPIO_ReadPin(_port, _pin) == GPIO_PIN_SET) ? 1 : 0;
+		}
+
+		// Запрет прерываний с сохранением прежнего состояния: безопасно, даже если они уже были запрещены.
+		// Сохранённое значение компилятор держит в регистре, на стек оно не попадает. Хранить его в поле
+		// класса невыгодно: это лишние str/ldr в память на каждом бите (проверено на Cortex-M3, -Os: +20 байт кода).
+		static uint32_t _IrqOff()
+		{
+			uint32_t primask = __get_PRIMASK();
+			__disable_irq();
+
+			return primask;
+		}
+
+		static void _IrqOn(uint32_t primask)
+		{
+			__set_PRIMASK(primask);
+		}
+
+		bool _SearchStop()
+		{
+			_search_done = true;
+
+			return false;
+		}
+
+
+		GPIO_TypeDef *_port;
+		uint16_t _pin;
 		TIM_HandleTypeDef *_htim;
-		GPIO_InitTypeDef _gpio_cfg;
+
+		rom_t _search_rom;
+		uint8_t _search_last = 0;
+		uint8_t _search_cmd = CMD_SEARCH_ROM;
+		bool _search_done = true;
 };
