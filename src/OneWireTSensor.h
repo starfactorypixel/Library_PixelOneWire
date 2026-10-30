@@ -48,6 +48,15 @@ class OneWireTSensor
 		static_assert(sizeof(scratchpad_t) == 9, "scratchpad_t must be 9 bytes");
 
 		static constexpr int16_t NO_VALID_TEMP = INT16_MAX;
+
+		// Метка «датчик не перезагружался» в TH/TL. +127 / -128 °C — пороги, при которых тревога
+		// никогда не срабатывает, и маловероятно, что такие же значения записаны в EEPROM.
+		static constexpr uint8_t MARK_TH = 0x7F;
+		static constexpr uint8_t MARK_TL = 0x80;
+
+		// Конфигурация DS18B20 / DS1822: 0 R1 R0 1 1 1 1 1. Пишется вместе с меткой, только в память датчика,
+		// поэтому настройка в EEPROM не меняется. 0x1F = 9 бит, 0x3F = 10, 0x5F = 11, 0x7F = 12 бит.
+		static constexpr uint8_t CFG_12BIT = 0x7F;
 		static constexpr uint16_t CONVERT_TIME = 800;		// мс, 12 бит = 750 мс + запас
 
 		// Фильтр сбоев: столько неудачных чтений подряд прощается (отдаётся последнее верное
@@ -163,19 +172,54 @@ class OneWireTSensor
 
 			int16_t raw = sp.temp;
 
-			// 85.00 °C — значение после включения питания: датчик перезагрузился и конвертации не было
-			if(_rom.code == 0x10)
+			const bool is_s20 = (_rom.code == 0x10);
+
+			// Метка — TH, TL и (у DS18B20 / DS1822) разрешение 12 бит. Её нет, если датчик перезагружался
+			// по питанию, опрашивается впервые или его кто-то перенастроил. Тогда ставим метку заново
+			// и проверяем, не пришло ли значение 85.00 °C, которое датчик выдаёт после включения без
+			// конвертации. Если метка на месте, 85.00 °C — настоящая температура.
+			if(sp.th != MARK_TH || sp.tl != MARK_TL || (is_s20 == false && sp.cfg != CFG_12BIT))
 			{
-				if(raw == 0x00AA) return false;
+				_WriteMark();
+
+				if(raw == (is_s20 ? 0x00AA : 0x0550))
+					return false;
+			}
+
+			if(is_s20)
+			{
 				temp = (int32_t)raw * 100 / 2;		// DS18S20: шаг 0.5 °C
 			}
 			else
 			{
-				if(raw == 0x0550) return false;
+				// При разрешении ниже 12 бит младшие биты не определены (бывает в одном чтении,
+				// если датчик перезагрузился перед конвертацией). При 12 битах маска ничего не меняет.
+				uint8_t undefined_bits = 3 - ((sp.cfg >> 5) & 0x03);
+				raw &= ~((1 << undefined_bits) - 1);
+
 				temp = (int32_t)raw * 100 / 16;		// DS18B20, DS1822: шаг 0.0625 °C
 			}
 
 			return true;
+		}
+
+
+		// Записать метку в TH/TL и разрешение 12 бит командой Write Scratchpad. Без Copy Scratchpad
+		// это попадает только в память датчика, не в EEPROM, поэтому после сброса по питанию датчик
+		// загрузит TH/TL/cfg из EEPROM и метка пропадёт. Все байты передаются подряд до следующего сброса.
+		void _WriteMark()
+		{
+			if(_driver->Reset() == false)
+				return;
+
+			_driver->MatchRom(_rom);
+			_driver->WriteByte(CMD_WRITE_SCRATCHPAD);
+			_driver->WriteByte(MARK_TH);
+			_driver->WriteByte(MARK_TL);
+			if(_rom.code != 0x10)
+				_driver->WriteByte(CFG_12BIT);		// DS18B20, DS1822: третий байт — конфигурация
+
+			return;
 		}
 
 
