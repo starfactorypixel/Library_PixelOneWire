@@ -48,6 +48,7 @@ class OneWireTSensor
 		static_assert(sizeof(scratchpad_t) == 9, "scratchpad_t must be 9 bytes");
 
 		static constexpr int16_t NO_VALID_TEMP = INT16_MAX;
+		static constexpr int8_t NO_VALID_TEMP8 = (int8_t)(NO_VALID_TEMP >> 8);
 
 		// Метка «датчик не перезагружался» в TH/TL. +127 / -128 °C — пороги, при которых тревога
 		// никогда не срабатывает, и маловероятно, что такие же значения записаны в EEPROM.
@@ -130,6 +131,15 @@ class OneWireTSensor
 		int16_t GetTemp() const
 		{
 			return IsValid() ? _temp : NO_VALID_TEMP;
+		}
+
+		// Последняя верная температура в целых градусах (с округлением) или NO_VALID_TEMP8
+		int8_t GetTemp8() const
+		{
+			if(!IsValid())
+				return NO_VALID_TEMP8;
+
+			return (int8_t)((_temp >= 0) ? (_temp + 50) / 100 : (_temp - 50) / 100);
 		}
 
 		const OneWireDriver::rom_t &GetRom() const
