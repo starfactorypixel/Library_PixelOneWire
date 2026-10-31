@@ -219,7 +219,7 @@ class OneWireTSens
 			for(uint8_t i = 0; i < _count; ++i)
 			{
 				if(_sensors[i].IsValid() == false) continue;
-				if(_sensors[i].GetTemp() < result) result = _sensors[i].GetTemp();
+				if(result == NO_VALID_TEMP || _sensors[i].GetTemp() < result) result = _sensors[i].GetTemp();
 			}
 
 			return result;
